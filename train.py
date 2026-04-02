@@ -12,6 +12,7 @@ from module.torchmdnet.model import create_model
 from module import dataset
 from module import model_util
 from module.lr_scheduler_wrappers import *
+import modules.config as config
 
 import os
 import json
@@ -692,7 +693,7 @@ def should_decay(param_name: str) -> bool:
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Train a CGSchNet network")
-    parser.add_argument("input", help="Processed data to train on ")
+    parser.add_argument("input", default=None, help="Processed data to train on ")
     parser.add_argument("result", default=None, nargs="?", help="Checkpoint directory to continue")
     parser.add_argument("-c", "--config", default="../configs/config.yaml", type=str, help="")
     parser.add_argument("--gpus", default=None, type=str, help="List of GPUs to train on (e.g. \"0,1,2\")")
@@ -719,45 +720,11 @@ if __name__ == "__main__":
     parser.add_argument("--embedding", type=str, default=None, help="Specify an alternate file to load embeddings from (default: embeddings.npy).")
     parser.add_argument("--chunk-dataset", type=int, default=None, help="Break the dataset into chunks of n proteins per batch")
     parser.add_argument("--npfile", action="store_true", help="Use file loader instead of mmap to load dataset")
+    parser.add_argument("--yaml", default=None, help="YAML config file to save")
 
     assert torch.cuda.is_available(), "CUDA is not available, please run on a machine with CUDA or use --gpus cpu"
 
-    args = parser.parse_args()
-
-    directory_path = args.input
-    assert os.path.isdir(directory_path), f"Input directory does not exist: {directory_path}"
-    result_directory = args.result
-    conf_path = args.config
-    assert os.path.isfile(conf_path), f"Config file does not exist: {conf_path}"
-    weight_decay = args.wd
-    learning_rate = args.lr
-    if args.gpus:
-        if args.gpus == "cpu":
-            gpu_ids = "cpu"
-        else:
-            gpu_ids = [int(i) for i in args.gpus.strip().split(",")]
-    else:
-        gpu_ids = "cpu"
-
-    epochs = args.epochs
-    batch_size = args.batch
-    val_ratio = args.val_ratio
-    atoms_per_call = args.apc
-    dry_run = args.dry_run
-    reset_early_stopping = args.reset_early_stopping
-    enable_shuffle = not args.no_shuffle
-    mini_epoch_size = args.mini_epoch
-    early_stopping = args.early_stopping
-    checkpoint_save = args.checkpoint_save
-    assert checkpoint_save >= 0
-
-    subsetpdbs = args.subsetpdbs
-    energy_weight = args.energy_weight
-    force_weight = args.force_weight
-    energy_matching = args.energy_weight != 0.0
-    embedding_filename = args.embedding
-    dataset_chunk_size = args.chunk_dataset
-    use_npfile = args.npfile
+    config = config.parse_config(parser.parse_args())
 
     # Relax the maximum number of open files as much as possible
     # We will potentially open a lot of files (~4 per molecule per ProteinDataset object)
@@ -765,35 +732,35 @@ if __name__ == "__main__":
     resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
 
     lr_scheduler = None
-    if args.cos_anneal:
-        T_0, T_mult = [int(i) for i in args.cos_anneal.split(",")]
+    if config.cos_anneal:
+        T_0, T_mult = [int(i) for i in config.cos_anneal.split(",")]
         lr_scheduler = SchedulerWrapper_CosineAnnealingWarmRestarts(T_0, T_mult)
-    if args.cos_lr:
+    if config.cos_lr:
         assert lr_scheduler is None
-        T_max, eta_min = args.cos_lr.split(",")
+        T_max, eta_min = config.cos_lr.split(",")
         T_max, eta_min = int(T_max), float(eta_min)
         lr_scheduler = SchedulerWrapper_CosineAnnealingLR(T_max, eta_min)
-    if args.exp_lr:
+    if config.exp_lr:
         assert lr_scheduler is None
-        lr_scheduler = SchedulerWrapper_ExponentialLR(float(args.exp_lr))
-    if args.plateau_lr:
+        lr_scheduler = SchedulerWrapper_ExponentialLR(float(config.exp_lr))
+    if config.plateau_lr:
         assert lr_scheduler is None
-        factor, patience, threshold, min_lr = args.plateau_lr.split(",")
+        factor, patience, threshold, min_lr = config.plateau_lr.split(",")
         factor, patience, threshold, min_lr = float(factor), int(patience), float(threshold), float(min_lr)
         lr_scheduler = SchedulerWrapper_ReduceLROnPlateau(factor, patience, threshold, min_lr)
 
-    if args.term_def is not None:
-        train_term_def = TermDef(path=args.term_def)
+    if config.term_def is not None:
+        train_term_def = TermDef(path=config.term_def)
     else:
         train_term_def = TermDef()
 
     try:
-        train_model(directory_path, result_directory=result_directory, conf_path=conf_path, dry_run=dry_run, weight_decay=weight_decay,
-                    learning_rate=learning_rate, gpu_ids=gpu_ids, epochs=epochs, batch_size=batch_size, val_ratio=val_ratio, scheduler=lr_scheduler,
-                    atoms_per_call=atoms_per_call, reset_early_stopping=reset_early_stopping, enable_shuffle=enable_shuffle,
-                    mini_epoch_size=mini_epoch_size, early_stopping=early_stopping, checkpoint_save=checkpoint_save, subsetpdbs=subsetpdbs, energy_weight=energy_weight,
-                    force_weight=force_weight, energy_matching=energy_matching, train_term_def=train_term_def, embedding_filename=embedding_filename,
-                    dataset_chunk_size=dataset_chunk_size, use_npfile=use_npfile)
+        train_model(config.input, result_directory=config.result, conf_path=config.config, dry_run=config.dry_run, weight_decay=config.wd,
+                    learning_rate=config.lr, gpu_ids=config.gpu_ids, epochs=config.epochs, batch_size=config.batch, val_ratio=config.val_ratio, scheduler=lr_scheduler,
+                    atoms_per_call=config.apc, reset_early_stopping=config.reset_early_stopping, enable_shuffle=config.enable_shuffle,
+                    mini_epoch_size=config.mini_epoch, early_stopping=config.early_stopping, checkpoint_save=config.checkpoint_save, subsetpdbs=config.subsetpdbs, energy_weight=config.energy_weight,
+                    force_weight=config.force_weight, energy_matching=config.energy_matching, train_term_def=train_term_def, embedding_filename=config.embedding,
+                    dataset_chunk_size=config.chunk_dataset, use_npfile=config.npfile)
     except Exception as e:
         # Uncaught exceptions cause pytorch to hang for quite a while before exiting
         traceback.print_tb(e.__traceback__)
