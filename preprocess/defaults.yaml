@@ -1,0 +1,17 @@
+# Optional defaults for `python -m preprocess --config preprocess/defaults.yaml`
+# CLI flags override these values.
+
+settings:
+  filter_not_processed_step_one: false
+  use_cached_fits: []
+  device_step_3: cpu
+  do_step_1: true
+  regen_cache_files: true
+
+num_cores: 32
+resume: false
+prior_plots: true
+optimize_forces: false
+no_box: false
+temp: 300
+fit_min_cnt: 0
