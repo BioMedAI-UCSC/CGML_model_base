@@ -1,5 +1,3 @@
-"""Prior builders and registry for CG preprocessing."""
-
 import json
 import os
 import pickle
@@ -13,7 +11,7 @@ from module import psfwriter
 from module.cg_mapping import CGMapping
 from module.torchmd_cg_mappings import CACB_MAP
 
-from .mapping import CGMappingDef_CA, CGMappingDef_CACB
+from .mapping import CGMappingDef_CA, CGMappingDef_CACB, CGMappingDef_CA_DNA
 
 class PriorBuilder:
     def __init__(self):
@@ -485,8 +483,275 @@ class Prior_CA_lj_only(Prior_CA):
         self.terms = {}
         self.terms["lj"] = prior.ParamNonbondedCalculator(fit_range=[3, 6])
 
+
+class Prior_CA_DNA(Prior_CA):
+    """Protein Cα + DNA 2-bead model; after bonded/angle fit, applies universal DNA stiffness (cgschnet)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.prior_params.update(
+            {
+                "prior_configuration_name": "CA_DNA",
+                "exclusions": ["1-2", "1-3"],
+                "forceterms": ["bonds", "angles"],
+            }
+        )
+        self.terms["bonds"] = prior.ParamBondedCalculator()
+        self.terms["angles"] = prior.ParamAngleCalculator(center=False)
+        self.cg_mapping_def: CGMappingDef_CA_DNA = CGMappingDef_CA_DNA()
+
+    def init_prior_dict(self) -> None:
+        super().init_prior_dict()
+        bead_type_to_mass: dict[str, float] = {}
+        for resname in self.cg_mapping_def.bead_types:
+            bead_types = self.cg_mapping_def.bead_types[resname]
+            bead_masses = self.cg_mapping_def.bead_masses.get(resname, [12.01] * len(bead_types))
+            for bt, bm in zip(bead_types, bead_masses):
+                bead_type_to_mass[bt] = float(bm)
+        for atom_type in self.priors["atomtypes"]:
+            if atom_type in bead_type_to_mass:
+                self.priors["masses"][atom_type] = bead_type_to_mass[atom_type]
+
+    def fit(
+        self,
+        temperature: float,
+        plot_dir: str | None = None,
+        use_cached_fits: list | None = None,
+    ) -> None:
+        if use_cached_fits is None:
+            use_cached_fits = []
+        print("[DEBUG] Starting fit for Prior_CA_DNA")
+        super().fit(temperature, plot_dir, use_cached_fits)
+        self._apply_universal_cg_parameters()
+        self._ensure_all_dna_params_exist()
+        self._validate_physics()
+        print("[DEBUG] Applied universal CG parameters for mixed protein–DNA systems")
+
+    def _apply_universal_cg_parameters(self) -> None:
+        UNIVERSAL = {
+            "DNA_BOND_K": 50.0,
+            "DNA_ANGLE_K": 30.0,
+            "PROTEIN_BOND_K": 10.0,
+            "PROTEIN_ANGLE_K": 2.0,
+            "DNA_BACKBONE_LENGTH": 5.5,
+            "DNA_BASE_DISTANCE": 5.75,
+            "DNA_BACKBONE_ANGLE": 170.0,
+        }
+        if "bonds" in self.priors:
+            for bond_type, params in self.priors["bonds"].items():
+                if isinstance(params, dict):
+                    current_k = float(params.get("k0", 1.0))
+                    current_r0 = float(params.get("req", 3.8))
+                elif isinstance(params, (list, tuple)) and len(params) >= 2:
+                    current_k = float(params[0])
+                    current_r0 = float(params[1])
+                else:
+                    print(f"[WARNING] Bond {bond_type} has unexpected format: {params}")
+                    continue
+                dna_token = any(t in bond_type for t in ("DBB", "DBA", "DBT", "DBG", "DBC"))
+                if dna_token:
+                    new_k = UNIVERSAL["DNA_BOND_K"]
+                    if "DBB-DBB" in bond_type:
+                        new_r0 = UNIVERSAL["DNA_BACKBONE_LENGTH"]
+                    elif "DBB" in bond_type:
+                        new_r0 = UNIVERSAL["DNA_BASE_DISTANCE"]
+                    else:
+                        new_r0 = current_r0
+                    self.priors["bonds"][bond_type] = {"k0": float(new_k), "req": float(new_r0)}
+                elif "CA" in bond_type and current_k < 5.0:
+                    if isinstance(self.priors["bonds"][bond_type], dict):
+                        self.priors["bonds"][bond_type]["k0"] = UNIVERSAL["PROTEIN_BOND_K"]
+                    else:
+                        self.priors["bonds"][bond_type][0] = UNIVERSAL["PROTEIN_BOND_K"]
+
+        if "angles" in self.priors:
+            for angle_type, value in self.priors["angles"].items():
+                if not isinstance(value, dict):
+                    continue
+                try:
+                    current_k0 = float(value.get("k0", 1.0))
+                except (ValueError, TypeError):
+                    continue
+                dna_kw = ("DBA", "DBB", "DBT", "DBG", "DBC")
+                if any(kw in angle_type for kw in dna_kw):
+                    if "DBB-DBB-DBB" in angle_type:
+                        value["theta0"] = UNIVERSAL["DNA_BACKBONE_ANGLE"]
+                        value["k0"] = UNIVERSAL["DNA_ANGLE_K"]
+                    else:
+                        value["k0"] = UNIVERSAL["DNA_ANGLE_K"]
+                elif "CA" in angle_type and current_k0 < 0.5:
+                    value["k0"] = UNIVERSAL["PROTEIN_ANGLE_K"]
+
+    def _has_dna_beads(self) -> bool:
+        """True if any loaded molecule has DNA CG atom types (DB*), not just protein Cα."""
+        for at in self.atom_types:
+            s = str(at)
+            if s.startswith("DB") or s.startswith("db"):
+                return True
+        return False
+
+    def _ensure_all_dna_params_exist(self) -> None:
+        if not self._has_dna_beads():
+            return
+        essential_dna_bonds = {
+            "DBB-DBB": [50.0, 5.5],
+            "DBB-DBA": [50.0, 5.75],
+            "DBB-DBT": [50.0, 5.75],
+            "DBB-DBG": [50.0, 5.75],
+            "DBB-DBC": [50.0, 5.75],
+        }
+        essential_dna_angles = {
+            "DBB-DBB-DBB": {"k0": 30.0, "theta0": 170.0},
+            "DBA-DBB-DBB": {"k0": 25.0, "theta0": 50.0},
+            "DBB-DBB-DBC": {"k0": 25.0, "theta0": 83.0},
+            "DBB-DBB-DBG": {"k0": 25.0, "theta0": 78.0},
+            "DBB-DBB-DBT": {"k0": 25.0, "theta0": 55.0},
+        }
+        for bond_type, params in essential_dna_bonds.items():
+            if bond_type not in self.priors.get("bonds", {}):
+                self.priors.setdefault("bonds", {})[bond_type] = params
+        for angle_type, params in essential_dna_angles.items():
+            if angle_type not in self.priors.get("angles", {}):
+                self.priors.setdefault("angles", {})[angle_type] = params
+
+    def _validate_physics(self) -> None:
+        print("\n[PHYSICS VALIDATION]")
+        print("=" * 50)
+        dna_stiffness_ok = True
+        if not self._has_dna_beads():
+            print(" (no DNA CG beads in this batch — skip DNA stiffness template checks)\n" + "=" * 50)
+            return
+        for bond_type, params in self.priors.get("bonds", {}).items():
+            if not any(t in bond_type for t in ("DBB", "DBA", "DBT", "DBG", "DBC")):
+                continue
+            try:
+                if isinstance(params, dict):
+                    k = float(params.get("k0", 0))
+                    r0 = float(params.get("req", 0))
+                elif isinstance(params, (list, tuple)) and len(params) >= 2:
+                    k, r0 = float(params[0]), float(params[1])
+                else:
+                    print(f" DNA bond {bond_type}: Unrecognized format {params}")
+                    continue
+                if k < 20.0:
+                    print(f"  DNA bond {bond_type}: k={k:.1f} (might be too soft)")
+                    dna_stiffness_ok = False
+                if r0 < 4.0 or r0 > 7.0:
+                    print(f"  DNA bond {bond_type}: r0={r0:.1f}Å (unusual)")
+            except (ValueError, TypeError, IndexError):
+                print(f"Could not parse DNA bond {bond_type}: {params}")
+        avg_dna_k = 0.0
+        avg_p_k = 0.0
+        dna_c = 0
+        p_c = 0
+        for bond_type, params in self.priors.get("bonds", {}).items():
+            try:
+                if isinstance(params, dict):
+                    k = float(params.get("k0", 0))
+                elif isinstance(params, (list, tuple)) and len(params) >= 2:
+                    k = float(params[0])
+                else:
+                    continue
+            except (ValueError, TypeError, IndexError):
+                continue
+            if any(t in bond_type for t in ("DBB", "DBA", "DBT", "DBG", "DBC")):
+                avg_dna_k += k
+                dna_c += 1
+            elif "CA" in bond_type:
+                avg_p_k += k
+                p_c += 1
+        if dna_c > 0 and p_c > 0:
+            avg_dna_k /= dna_c
+            avg_p_k /= p_c
+            ratio = avg_dna_k / avg_p_k if avg_p_k > 0 else 999.0
+            print(f" Stiffness ratio (DNA:Protein) = {ratio:.1f}:1")
+            print(f" Average DNA k = {avg_dna_k:.1f}, Protein k = {avg_p_k:.1f}")
+            if ratio < 2.0:
+                print("DNA not stiff enough relative to protein!")
+        print("\n[ANGLES VALIDATION]")
+        dna_ang = 0
+        tot = 0.0
+        for angle_type, value in self.priors.get("angles", {}).items():
+            if not isinstance(value, dict):
+                continue
+            if not any(t in angle_type for t in ("DBA", "DBB", "DBT", "DBG", "DBC")):
+                continue
+            try:
+                k0 = float(value.get("k0", 0))
+                tot += k0
+                dna_ang += 1
+                if "DBB-DBB-DBB" in angle_type:
+                    t0 = float(value.get("theta0", 0))
+                    if t0 < 150 or t0 > 190:
+                        print(
+                            f"DNA backbone angle {angle_type}: theta0={t0:.1f}° (should be ~170°)"
+                        )
+            except (ValueError, TypeError):
+                pass
+        if dna_ang > 0:
+            print(f"  Average DNA angle k0 = {tot / dna_ang:.1f}")
+            if tot / dna_ang < 10.0:
+                print("DNA angles might be too soft!")
+        if dna_stiffness_ok:
+            print("\n  DNA bond parameters look reasonable")
+        else:
+            print("\n  DNA bond parameters need attention")
+        print("=" * 50)
+
+    def build_mapping(self, topology):
+        return CGMapping(topology, self.cg_mapping_def)
+
+    def map_embeddings(self, selected_atoms, topology):  # pyright: ignore[reportIncompatibleMethodOverride]
+        standard = {
+            "ALA",
+            "ARG",
+            "ASN",
+            "ASP",
+            "CYS",
+            "GLU",
+            "GLN",
+            "GLY",
+            "HIS",
+            "ILE",
+            "LEU",
+            "LYS",
+            "MET",
+            "PHE",
+            "PRO",
+            "SER",
+            "THR",
+            "TRP",
+            "TYR",
+            "VAL",
+        }
+        dna = {"DA", "DT", "DG", "DC"}
+        all_r = sorted(standard | dna)
+        residue_map = {res: i + 1 for i, res in enumerate(all_r)}
+        result: list[int] = []
+        for a_idx in selected_atoms:
+            r_name = "".join(filter(str.isalpha, topology.atom(a_idx).residue.name))
+            if r_name not in residue_map:
+                print(f"[WARNING] Residue {r_name!r} not in mapping!")
+            result.append(residue_map.get(r_name, 0))
+        return np.array(result, dtype=int)
+
+    def write_psf(self, pdb_file, psf_file):
+        bonds = "bonds" in self.terms
+        angles = "angles" in self.terms
+        dihedrals = "dihedrals" in self.terms
+        return psfwriter.pdb2psf_CA(
+            pdb_file,
+            psf_file,
+            bonds=bonds,
+            angles=angles,
+            dihedrals=dihedrals,
+            tag_beta_turns=self.tag_beta_turns,
+        )
+
+
 PRIOR_TYPES = {
     "CA": Prior_CA,
+    "CA_DNA": Prior_CA_DNA,
     "CACB": Prior_CACB,
     "CACB_lj": Prior_CACB_lj,
     "CACB_lj_angle_dihedral": Prior_CACB_lj_angle_dihedral,

@@ -1,5 +1,3 @@
-"""CG bead mapping definitions."""
-
 class CGMappingDef_CA:
     def __init__(self):
         residues = ["ALA", "CYS", "ASP", "GLU", "PHE", "GLY", "HIS", "ILE", "LYS", "LEU", "MET", "ASN", "PRO", "HYP", "GLN", "ARG", "SER", "THR", "VAL", "TRP", "TYR"]
@@ -78,3 +76,63 @@ class CGMappingDef_CACB:
         self.bead_atom_names["GLY"] = ["CA"]
         self.bead_masses = {k: [12.01]*len(v) for k,v in self.bead_types.items()}
         self.bead_backbone_idx = {k: 0 for k in residues}
+
+
+class CGMappingDef_CA_DNA(CGMappingDef_CA):
+    """Protein Cα plus coarse DNA (2 beads/residue: backbone + base) — matches cgschnet `Prior_CA_DNA` mapping."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        dna_residues = ["DA", "DT", "DG", "DC"]
+        backbone_atoms = [
+            "P",
+            "OP1",
+            "OP2",
+            "O5'",
+            "C5'",
+            "C4'",
+            "C3'",
+            "O3'",
+            "C1'",
+            "C2'",
+            "O4'",
+        ]
+        # 5' or fragment models without phosphate: COM of sugar + backbone linkage only (same order as cgschnet, minus P/OP*)
+        backbone_atoms_no_phosphate = [
+            "O5'",
+            "C5'",
+            "C4'",
+            "C3'",
+            "O3'",
+            "C1'",
+            "C2'",
+            "O4'",
+        ]
+        base_atoms = {
+            "DA": ["N9", "C8", "N7", "C5", "C6", "N6", "N1", "C2", "N3", "C4"],
+            "DT": ["N1", "C2", "O2", "N3", "C4", "O4", "C5", "C6", "C7"],
+            "DG": ["N9", "C8", "N7", "C5", "C6", "O6", "N1", "C2", "N2", "N3", "C4"],
+            "DC": ["N1", "C2", "O2", "N3", "C4", "N4", "C5", "C6"],
+        }
+        for resname in dna_residues:
+            self.bead_atom_selection[resname] = [backbone_atoms, base_atoms[resname]]
+        # Tried in order for the first (DBB) bead; see `module.cg_mapping.CGMapping`
+        self.dna_backbone_atom_candidates = (backbone_atoms, backbone_atoms_no_phosphate)
+        for resname in dna_residues:
+            base_code = resname[1]
+            self.bead_atom_names[resname] = ["DBB", f"DB{base_code}"]
+        for resname in dna_residues:
+            base_code = resname[1]
+            self.bead_types[resname] = ["DBB", f"DB{base_code}"]
+        base_masses = {"A": 134.1, "T": 125.1, "G": 150.1, "C": 110.1}
+        for resname in dna_residues:
+            base_code = resname[1]
+            self.bead_masses[resname] = [178.08, base_masses[base_code]]
+        current_max_id = max(self.bead_embeddings.values())[0]
+        dbb_id = current_max_id + 1
+        base_ids = {"A": dbb_id + 1, "T": dbb_id + 2, "G": dbb_id + 3, "C": dbb_id + 4}
+        for resname in dna_residues:
+            base_code = resname[1]
+            self.bead_embeddings[resname] = [dbb_id, base_ids[base_code]]
+        for resname in dna_residues:
+            self.bead_backbone_idx[resname] = 0

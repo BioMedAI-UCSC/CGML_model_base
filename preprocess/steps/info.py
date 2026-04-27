@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 from tqdm import tqdm
 
-from ..loaders import slice_to_str
+from ..loaders import num_frames_for_info, slice_to_str
 
 if TYPE_CHECKING:
     from ..runner import Preprocessor
@@ -17,6 +17,7 @@ def _info_dict(pre: Preprocessor) -> dict:
     tag_beta = pre.prior_builder.prior_params.get("tag_beta_turns", False)
     return {
         "input_paths": [i["path"] for i in pre.dataset_conf],
+        "num_frames": num_frames_for_info(pre.frame_slice),
         "frame_slice": slice_to_str(pre.frame_slice),
         "pdbids": pre.trajectory.pdb_ids(),
         "optimize_forces": pre.optimize_forces,
@@ -34,9 +35,19 @@ def assert_resume_compatible(pre: Preprocessor, info_dict: dict) -> None:
         return
     with open(info_path, "rt", encoding="utf-8") as f:
         previous_info = json.load(f)
-    for k in ["box", "frame_slice", "optimize_forces", "prior_name"]:
+    for k in ("box", "optimize_forces", "prior_name"):
         assert info_dict[k] == previous_info[k], (
             f"Can't resume with different parameters: {k}: {info_dict[k]} != {previous_info[k]}"
+        )
+    if "num_frames" in previous_info and previous_info.get("num_frames") is not None:
+        assert info_dict.get("num_frames") == previous_info.get("num_frames"), (
+            "Can't resume with different num_frames: "
+            f"{info_dict.get('num_frames')} != {previous_info.get('num_frames')}"
+        )
+    else:
+        assert info_dict.get("frame_slice") == previous_info.get("frame_slice"), (
+            "Can't resume with different frame_slice: "
+            f"{info_dict.get('frame_slice')!r} != {previous_info.get('frame_slice')!r}"
         )
     if "tag_beta_turns" in previous_info:
         assert info_dict["tag_beta_turns"] == previous_info["tag_beta_turns"], (

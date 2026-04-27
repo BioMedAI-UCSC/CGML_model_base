@@ -1,4 +1,4 @@
-"""Trajectory discovery and HDF5 slice loading."""
+"""traj discovery and HDF5 slice loading"""
 
 from __future__ import annotations
 
@@ -14,6 +14,18 @@ def slice_to_str(s: slice) -> str:
     result = [s.start, s.stop, s.step]
     result = [str(i) if i is not None else "" for i in result]
     return ":".join(result)
+
+
+def num_frames_for_info(s: slice | None) -> int | None:
+    """Cgschnet `result/info.json` uses `num_frames` (int) for `slice(0, N)`; else None for all frames."""
+    if s is None or s == slice(None) or (s.start is None and s.stop is None):
+        return None
+    st, sp, stp = s.start, s.stop, s.step
+    if stp not in (None, 1):
+        return None
+    if st not in (0, None) or sp is None:
+        return None
+    return int(sp)
 
 
 def get_prior_params_path(prior_path: str) -> str:

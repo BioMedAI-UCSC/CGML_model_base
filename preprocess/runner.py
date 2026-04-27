@@ -12,6 +12,7 @@ import mdtraj
 import numpy as np
 from tqdm import tqdm
 
+from module.frame_utils import step3_classical_worker_count
 from module.make_deltaforces import DeltaForces
 
 from .loaders import load_h5_traj_slice, slice_to_str
@@ -79,15 +80,11 @@ class Preprocessor:
         print("Number of cores used for parallelization:", self.num_cores)
 
     def _step3_classical_workers(self, n_frames: int) -> int:
-        if n_frames <= 1:
-            return 1
-        cpu = os.cpu_count() or 4
-        n_pdbs = len(self.trajectory.pdb_ids())
-        if n_pdbs <= 1:
-            return min(n_frames, max(1, min(self.num_cores, cpu)))
-        concurrent_pdbs = min(max(1, self.num_cores), cpu)
-        per_pdb = max(1, cpu // concurrent_pdbs)
-        return min(n_frames, max(2, per_pdb))
+        return step3_classical_worker_count(
+            n_frames,
+            len(self.trajectory.pdb_ids()),
+            self.num_cores,
+        )
 
     def step1_threading(self, pdbid):
         try:

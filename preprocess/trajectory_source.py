@@ -1,4 +1,4 @@
-"""Pluggable trajectory path resolution (H5 batch layout today; swap implementations for other layouts)."""
+"""pluggable trajectory path resolution (H5 batch layout today, can swap to direct westpa if we want"""
 
 from __future__ import annotations
 

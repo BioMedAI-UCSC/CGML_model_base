@@ -1,5 +1,3 @@
-"""CG preprocessing package. Public API mirrors legacy `preprocess` module for `simulate.py` etc."""
-
 from .config_manager import build_preprocess_settings, load_preprocess_yaml
 from .config_models import PreprocessYamlConfig, SettingsSection
 from .loaders import (
@@ -15,6 +13,7 @@ from .prior_builder import (
     PRIOR_TYPES,
     PriorBuilder,
     Prior_CA,
+    Prior_CA_DNA,
     Prior_CA_lj,
     Prior_CA_lj_angle,
     Prior_CA_lj_angle_dihedral,
@@ -46,6 +45,7 @@ __all__ = [
     "prior_types",
     "PriorBuilder",
     "Prior_CA",
+    "Prior_CA_DNA",
     "Prior_CACB",
     "Prior_CACB_lj",
     "Prior_CACB_lj_angle_dihedral",
