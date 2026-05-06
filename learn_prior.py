@@ -556,29 +556,50 @@ def train(data_dir, pdb_ids, checkpoint_dir, n_epochs, batch_size, learning_rate
 
 ### End Train
 
-if __name__ == "__main__":
+# ---------------------------------------------------------------------------
+# Entry-point helpers: collection → validation → processing
+# ---------------------------------------------------------------------------
+
+def build_parser():
     import argparse
     parser = argparse.ArgumentParser(description="Train a TorchMD prior forcefield")
     parser.add_argument("input", help="Preprocessed prior & data to train on")
     parser.add_argument("result", help="Checkpoint save directory")
-    parser.add_argument("--pdbids", nargs="*", help="List of specific PDB IDs to process")
+    parser.add_argument("--pdbids", nargs="*", help="Restrict training to these PDB IDs")
     parser.add_argument("--batch", type=int, default=10, help="The batch size to use")
     parser.add_argument("--epochs", type=int, default=25, help="The total number of epochs to train for")
     parser.add_argument("--lr", type=float, default=0.005, help="Learning rate")
-    parser.add_argument("--gamma", type=float, default=None, help="Learning rate scheduler gamma")
-    parser.add_argument("--clip-parameters", action='store_true', help="Clip parameters to a valid range after each update")
+    parser.add_argument("--gamma", type=float, default=None, help="Exponential LR scheduler gamma")
+    parser.add_argument("--clip-parameters", action='store_true',
+                        help="Clip parameters to a valid range after each update")
     parser.add_argument('--initial-loss', default=True, action=argparse.BooleanOptionalAction,
-                        help="Whether to calculate initial loss before training. Default=True")
+                        help="Calculate loss before the first training step (default=True)")
+    return parser
 
-    args = parser.parse_args()
-    print(args)
 
-    train(data_dir = args.input,
-          pdb_ids = args.pdbids,
-          checkpoint_dir = args.result,
-          n_epochs = args.epochs,
-          batch_size = args.batch,
-          learning_rate = args.lr,
-          scheduler_gamma = args.gamma,
-          clip_parameters = args.clip_parameters,
-          initial_loss_calc = args.initial_loss)
+def validate_config(cfg) -> None:
+    assert os.path.isdir(cfg.input), f"Input directory does not exist: {cfg.input}"
+    assert cfg.lr > 0, "--lr must be positive"
+    assert cfg.epochs > 0, "--epochs must be positive"
+
+
+def process_config(cfg) -> dict:
+    return dict(
+        data_dir=cfg.input,
+        pdb_ids=cfg.pdbids,
+        checkpoint_dir=cfg.result,
+        n_epochs=cfg.epochs,
+        batch_size=cfg.batch,
+        learning_rate=cfg.lr,
+        scheduler_gamma=cfg.gamma,
+        clip_parameters=cfg.clip_parameters,
+        initial_loss_calc=cfg.initial_loss,
+    )
+
+
+if __name__ == "__main__":
+    from module.base_config import BaseConfig
+    cfg = BaseConfig(build_parser())
+    print(cfg.as_namespace())
+    validate_config(cfg)
+    train(**process_config(cfg))

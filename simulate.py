@@ -531,33 +531,75 @@ def build_calc(model, mol, embeddings, use_box=False, replicas=1, temperature=30
 class ArgsMock():
     pass
 
-def main():
+# ---------------------------------------------------------------------------
+# Entry-point helpers: collection → validation → processing
+# ---------------------------------------------------------------------------
+
+def build_parser():
     import argparse
     arg_parser = argparse.ArgumentParser()
     arg_parser.add_argument("checkpoint_path", help="The model checkpoint to use")
-    arg_parser.add_argument("processed_path", help="One or more input files from which the model simulations will start. Each different input file will be processed as a different simulation replica.", nargs="+")
-    arg_parser.add_argument("--conf", default=None, help="The hyperparameters to use instead of those contained in the checkpoint")
-    arg_parser.add_argument("--max-num-neighbors", default=None, type=int, help="Override the 'max_num_neighbors' parameter of the model")
+    arg_parser.add_argument("processed_path", nargs="+",
+                            help="One or more input files to start simulations from. "
+                                 "Each file is treated as a separate replica.")
+    arg_parser.add_argument("--conf", default=None,
+                            help="Hyperparameter file to use instead of those stored in the checkpoint")
+    arg_parser.add_argument("--max-num-neighbors", default=None, type=int,
+                            help="Override the 'max_num_neighbors' parameter of the model")
     arg_parser.add_argument("--temperature", default=300, type=int, help="Simulation temperature (Kelvin)")
     arg_parser.add_argument("--timestep", default=1, type=int, help="Simulation timestep (femtoseconds)")
     arg_parser.add_argument("--steps", default=10000, type=int, help="The number of frames to simulate")
-    arg_parser.add_argument("-o", "--output", default="sim.pdb", help="The output file name (may be a .pdb or .h5 file)")
+    arg_parser.add_argument("-o", "--output", default="sim.pdb",
+                            help="Output file name (.pdb or .h5)")
     arg_parser.add_argument("--save-steps", default=100, type=int, help="Save frames every n steps")
-    arg_parser.add_argument("--prior-only", default=False, action='store_true', help="Disable the model and use only the prior forcefield")
+    arg_parser.add_argument("--prior-only", default=False, action='store_true',
+                            help="Disable the model and run with the prior forcefield only")
     arg_parser.add_argument('--no-box', action='store_true', help='Do not use box information')
-    arg_parser.add_argument("--replicas", default=1, type=int, help="The number of simulations running in parallel")
-    arg_parser.add_argument("--torchmd", default=False, action='store_true', help="Use TorchMD for the prior instead of TorchForceField")
-    arg_parser.add_argument("--verbose", default=True, action='store_true', help="Prints detailed logs")
-    arg_parser.add_argument("--prior-nn", default=None, type=str, help="Path to the folder of a neural network prior.")
-    
+    arg_parser.add_argument("--replicas", default=1, type=int,
+                            help="Number of parallel simulations to run")
+    arg_parser.add_argument("--torchmd", default=False, action='store_true',
+                            help="Use TorchMD for the prior instead of TorchForceField")
+    arg_parser.add_argument("--verbose", default=True, action='store_true', help="Print detailed logs")
+    arg_parser.add_argument("--prior-nn", default=None, type=str,
+                            help="Path to a neural network prior folder")
+    return arg_parser
 
-    args = arg_parser.parse_args()
-    print(args)
 
-    run_simulation(args.checkpoint_path, args.processed_path, conf=args.conf, max_num_neighbors=args.max_num_neighbors,
-                   temperature=args.temperature, timestep=args.timestep, steps=args.steps, output=args.output, save_steps=args.save_steps,
-                   prior_only=args.prior_only, no_box=args.no_box, replicas=args.replicas, torchmd=args.torchmd, verbose=args.verbose,
-                   prior_nn=args.prior_nn, gpu=0)
+def validate_config(cfg) -> None:
+    assert os.path.exists(cfg.checkpoint_path) or os.path.isdir(cfg.checkpoint_path), \
+        f"Checkpoint not found: {cfg.checkpoint_path}"
+    output_dir = os.path.dirname(cfg.output)
+    if output_dir:
+        assert os.path.exists(output_dir), f"Output directory does not exist: {output_dir}"
+
+
+def process_config(cfg) -> dict:
+    return dict(
+        checkpoint_path=cfg.checkpoint_path,
+        processed_path=cfg.processed_path,
+        conf=cfg.conf,
+        max_num_neighbors=cfg.max_num_neighbors,
+        temperature=cfg.temperature,
+        timestep=cfg.timestep,
+        steps=cfg.steps,
+        output=cfg.output,
+        save_steps=cfg.save_steps,
+        prior_only=cfg.prior_only,
+        no_box=cfg.no_box,
+        replicas=cfg.replicas,
+        torchmd=cfg.torchmd,
+        verbose=cfg.verbose,
+        prior_nn=cfg.prior_nn,
+        gpu=0,
+    )
+
+
+def main():
+    from module.base_config import BaseConfig
+    cfg = BaseConfig(build_parser())
+    validate_config(cfg)
+    params = process_config(cfg)
+    run_simulation(**params)
 
 def run_simulation(checkpoint_path, processed_path, conf=None, max_num_neighbors=None,
                    temperature=300, timestep=1, steps=10000, output='sim.pdb', save_steps=100,

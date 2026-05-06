@@ -33,33 +33,52 @@ def remove_checkpoint_keys(checkpoint_path, keys):
 
     torch.save(checkpoint_dict, checkpoint_path)
 
-if __name__ == "__main__":
+# ---------------------------------------------------------------------------
+# Entry-point helpers: collection → validation → processing
+# ---------------------------------------------------------------------------
+
+def build_parser():
     import argparse
+    arg_parser = argparse.ArgumentParser(
+        description="Inspect or modify a model checkpoint file.")
+    arg_parser.add_argument("checkpoint_path", help="Path to the model checkpoint (.pth or directory)")
+    arg_parser.add_argument("--reset-optimizer", action="store_true", help="Remove the optimizer state")
+    arg_parser.add_argument("--reset-scheduler", action="store_true", help="Remove the scheduler state")
+    arg_parser.add_argument("--reset-epoch", action="store_true", help="Remove the epoch counter and history")
+    arg_parser.add_argument("--info", action="store_true", help="Print the current epoch and model config")
+    return arg_parser
 
-    arg_parser = argparse.ArgumentParser()
-    arg_parser.add_argument("checkpoint_path", help="The model checkpoint path")
-    arg_parser.add_argument("--reset-optimizer", action="store_true", help="Reset the optimizer state")
-    arg_parser.add_argument("--reset-scheduler", action="store_true", help="Reset the scheduler state")
-    arg_parser.add_argument("--reset-epoch", action="store_true", help="Reset the epoch and history")
-    arg_parser.add_argument("--info", action="store_true", help="Show the current epoch & config")
 
-    args = arg_parser.parse_args()
+def validate_config(cfg) -> None:
+    path = cfg.checkpoint_path
+    is_valid = os.path.isfile(path) or (os.path.isdir(path) and os.path.isfile(os.path.join(path, "checkpoint.pth")))
+    assert is_valid, f"Checkpoint not found: {path}"
 
-    if args.info:
-        checkpoint = torch.load(args.checkpoint_path, map_location="cpu")
+
+def process_config(cfg) -> list:
+    keys_to_remove = []
+    if cfg.reset_optimizer:
+        keys_to_remove.append("optimizer")
+    if cfg.reset_scheduler:
+        keys_to_remove.append("scheduler")
+    if cfg.reset_epoch:
+        keys_to_remove.append("epoch")
+    return keys_to_remove
+
+
+if __name__ == "__main__":
+    from module.base_config import BaseConfig
+    cfg = BaseConfig(build_parser())
+    validate_config(cfg)
+
+    if cfg.info:
+        checkpoint = torch.load(cfg.checkpoint_path, map_location="cpu")
         print(f"Epoch: {checkpoint['epoch']}")
         print("Config:")
         config_str = yaml.dump(checkpoint["hyper_parameters"])
         print("\n".join(["  " + i for i in config_str.split("\n")]))
 
-    keys_to_remove = []
-    if args.reset_optimizer:
-        keys_to_remove.append("optimizer")
-    if args.reset_scheduler:
-        keys_to_remove.append("scheduler")
-    if args.reset_epoch:
-        keys_to_remove.append("epoch")
-
-    if len(keys_to_remove):
-        remove_checkpoint_keys(args.checkpoint_path, keys_to_remove)
+    keys_to_remove = process_config(cfg)
+    if keys_to_remove:
+        remove_checkpoint_keys(cfg.checkpoint_path, keys_to_remove)
 
