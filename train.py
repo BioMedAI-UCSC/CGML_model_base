@@ -259,7 +259,7 @@ class RoundRobinDataWrapper:
 
 def gen_dataloaders(directory_path, pdb_list, energy_filename, embedding_filename,
                     use_npfile, enable_shuffle, val_ratio, batch_size, atoms_per_call,
-                    ddp: DistributedContext):
+                    num_workers, ddp: DistributedContext):
     """Build train/val DataLoaders for one PDB chunk, with optional DistributedSampler."""
     print("Dataset:", " ".join(pdb_list))
     all_data = dataset.ProteinDataset(
@@ -293,11 +293,11 @@ def gen_dataloaders(directory_path, pdb_list, energy_filename, embedding_filenam
     )
 
     train_loader = DataLoader(
-        train_set, batch_size=batch_size, shuffle=False, num_workers=4,
+        train_set, batch_size=batch_size, shuffle=False, num_workers=num_workers,
         persistent_workers=True, pin_memory=True, collate_fn=collate_fn, sampler=train_sampler,
     )
     val_loader = DataLoader(
-        val_set, batch_size=batch_size, shuffle=False, num_workers=4,
+        val_set, batch_size=batch_size, shuffle=False, num_workers=num_workers,
         persistent_workers=True, pin_memory=True, collate_fn=collate_fn, sampler=val_sampler,
     )
     return all_data, train_loader, val_loader, train_sampler
@@ -305,7 +305,9 @@ def gen_dataloaders(directory_path, pdb_list, energy_filename, embedding_filenam
 
 def _load_pdb_list(directory_path, subsetpdbs, dataset_chunk_size):
     """Read, deduplicate, shuffle, and optionally chunk the PDB ID list."""
-    with open(os.path.join(directory_path, "result", subsetpdbs), 'r') as f:
+    if subsetpdbs is None:
+        subsetpdbs = os.path.join(directory_path, "result", "ok_list.txt")
+    with open(subsetpdbs, 'r') as f:
         pdb_list = f.read().split('\n')
     pdb_list = sorted(set(p for p in pdb_list if p))
     pdb_list = deterministic_shuffle(pdb_list, seed=47563537)
@@ -318,13 +320,14 @@ def _load_pdb_list(directory_path, subsetpdbs, dataset_chunk_size):
 
 def _build_all_dataloaders(pdb_lists, directory_path, energy_filename, embedding_filename,
                             use_npfile, enable_shuffle, val_ratio, batch_size, atoms_per_call,
+                            num_workers,
                             ddp: DistributedContext):
     """Build datasets and merged RoundRobin loaders for all PDB chunks."""
     datasets, train_loaders, val_loaders, train_samplers = [], [], [], []
     for pdb_chunk in pdb_lists:
         ds, train_loader, val_loader, sampler = gen_dataloaders(
             directory_path, pdb_chunk, energy_filename, embedding_filename,
-            use_npfile, enable_shuffle, val_ratio, batch_size, atoms_per_call, ddp,
+            use_npfile, enable_shuffle, val_ratio, batch_size, atoms_per_call, num_workers, ddp,
         )
         datasets.append(ds)
         train_loaders.append(train_loader)
@@ -542,9 +545,7 @@ def _setup_result_directory(result_directory, epoch, dry_run, ddp: DistributedCo
     """Create the result directory for a fresh run, or validate it for resumption."""
     if epoch > 0:
         pass  # Resuming — directory already exists
-    elif not result_directory or not os.path.exists(result_directory):
-        if not result_directory:
-            result_directory = "../data/result-" + datetime.datetime.now().strftime("%Y.%m.%d-%H.%M.%S")
+    elif not os.path.exists(result_directory):
         if not dry_run and ddp.is_main:
             os.makedirs(result_directory, exist_ok=False)
         if ddp.is_main:
@@ -910,6 +911,7 @@ def train_model(
     scheduler, reset_early_stopping, enable_shuffle, mini_epoch_size, early_stopping,
     checkpoint_save, subsetpdbs, energy_weight, force_weight, energy_matching,
     train_term_def, embedding_filename, dataset_chunk_size, use_npfile, use_force_weights,
+    num_workers,
     ddp: Optional[DistributedContext] = None,
 ):
     if ddp is None:
@@ -922,7 +924,7 @@ def train_model(
     pdb_lists, pdb_list = _load_pdb_list(directory_path, subsetpdbs, dataset_chunk_size)
     datasets, train_data, val_data, train_samplers = _build_all_dataloaders(
         pdb_lists, directory_path, energy_filename, embedding_filename,
-        use_npfile, enable_shuffle, val_ratio, batch_size, atoms_per_call, ddp,
+        use_npfile, enable_shuffle, val_ratio, batch_size, atoms_per_call, num_workers, ddp,
     )
 
     conf = _load_model_conf(conf_path, ddp)
@@ -1007,7 +1009,7 @@ def build_parser():
     import argparse
     parser = argparse.ArgumentParser(description="Train a CGSchNet network")
     parser.add_argument("input", help="Processed data to train on")
-    parser.add_argument("result", default=None, nargs="?", help="Checkpoint directory to continue")
+    parser.add_argument("result", help="Checkpoint directory to continue")
     parser.add_argument("-c", "--config", default="../configs/config.yaml", type=str, help="Path to model architecture config YAML")
     parser.add_argument("--gpus", default=None, type=str, help="List of GPUs to train on (e.g. \"0,1,2\") or \"cpu\"")
     parser.add_argument("--batch", type=int, default=50, help="The batch size to use")
@@ -1023,10 +1025,11 @@ def build_parser():
     parser.add_argument("--dry-run", action="store_true", help="Do a dry run of the training loop but produce no output")
     parser.add_argument("--reset-early-stopping", action="store_true", help="Reset the early stopping check to start from the current epoch")
     parser.add_argument("--no-shuffle", action="store_true", help="Do not shuffle the training dataset")
+    parser.add_argument("--num-workers", type=int, default=0, help="Number of workers to use for data loading")
     parser.add_argument("--mini-epoch", type=int, default=None, help="Save a mini epoch after every n batches")
     parser.add_argument("--early-stopping", type=int, default=1, help="Epochs validation loss can increase before early stopping, or -1 to disable (default=1)")
     parser.add_argument("--checkpoint-save", type=int, default=10, help="Save a backup checkpoint every n epochs, 0 to disable (default=10)")
-    parser.add_argument("--subsetpdbs", default='ok_list.txt', type=str, help="Change the pdbid list used when reading in the dataset (default=ok_list.txt)")
+    parser.add_argument("--subsetpdbs", default=None, type=str, help="Change the pdbid list used when reading in the dataset (default=input_dir/result/ok_list.txt)")
     parser.add_argument("--energy-weight", default=0.0, type=float, help="Energy weighting for loss function")
     parser.add_argument("--force-weight", default=1.0, type=float, help="Force weighting for loss function")
     parser.add_argument("--term-def", default=None, type=str, help="Path to a term definition yaml file for additional loss terms during training")
@@ -1041,6 +1044,7 @@ def build_parser():
 def validate_config(cfg) -> None:
     assert torch.cuda.is_available(), "CUDA is not available, please run on a machine with CUDA or use --gpus cpu"
     assert os.path.isdir(cfg.input), f"Input directory does not exist: {cfg.input}"
+    assert os.path.isdir(cfg.result), f"Result directory does not exist: {cfg.result}"
     assert os.path.isfile(cfg.config), f"Config file does not exist: {cfg.config}"
     assert cfg.checkpoint_save >= 0, "--checkpoint-save must be >= 0"
     n_schedulers = sum(s is not None for s in [cfg.cos_anneal, cfg.cos_lr, cfg.exp_lr, cfg.plateau_lr])
@@ -1072,7 +1076,7 @@ def process_config(cfg) -> dict:
 
     # Raise the OS file-descriptor limit — large datasets open ~4 files per molecule
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-    resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+    resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
 
     return dict(
         directory_path=cfg.input,
@@ -1101,6 +1105,7 @@ def process_config(cfg) -> dict:
         dataset_chunk_size=cfg.chunk_dataset,
         use_npfile=cfg.npfile,
         use_force_weights=cfg.use_force_weights,
+        num_workers=cfg.num_workers,
     )
 
 
