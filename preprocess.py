@@ -84,6 +84,65 @@ class CGMappingDef_CA:
         self.bead_masses = {k: [12.01] for k in residues}
         self.bead_backbone_idx = {k: 0 for k in residues}
 
+
+class CGMappingDef_CA_DNA(CGMappingDef_CA):
+    """cgff DNA extension of CGMappingDef_CA.
+
+    Adds DA/DC/DG/DT nucleotide entries with a single P-atom bead per
+    nucleotide. Protein residues remain Ca-only. DNA atom-naming follows
+    the standard PDB convention used by AMBER bsc1/OL15 (P, OP1, OP2,
+    O5', C5', C4', O4', C3', O3', C2', C1', N1/N3/N9, etc.).
+
+    Nucleotide embeddings extend the protein embedding map. The integer
+    indices stay disjoint from protein indices so a single embedding
+    table can serve both.
+    """
+
+    def __init__(self):
+        super().__init__()
+        dna_residues = ("DA", "DC", "DG", "DT")
+
+        # Bead = single P atom. Mass 30.97 (phosphorus). Bead type "PA"/"PC"/"PG"/"PT"
+        # (P prefix to disambiguate from protein bead types).
+        for n in dna_residues:
+            self.bead_atom_selection[n] = [["P"]]
+            self.bead_types[n] = [f"P{n[-1]}"]
+            self.bead_atom_names[n] = ["P"]
+            self.bead_masses[n] = [30.97]  # phosphorus
+            self.bead_backbone_idx[n] = 0
+
+        # 5'-terminal nucleotides lack a P atom. AMBER convention writes
+        # them as DA5/DC5/DG5/DT5 (or sometimes plain DA with no P). For
+        # the first version we register the variant residue names with
+        # alternative atom selections that fall back to O5' / C5' / C4'
+        # so the chain still gets a bead at the 5' end.
+        for n in dna_residues:
+            for tag in (n + "5",):
+                self.bead_atom_selection[tag] = [["O5'"]]
+                self.bead_types[tag] = [f"P{n[-1]}5"]
+                self.bead_atom_names[tag] = ["P"]
+                self.bead_masses[tag] = [16.00]  # oxygen
+                self.bead_backbone_idx[tag] = 0
+            # 3' terminal variant (still has P): use the same as standard.
+            tag3 = n + "3"
+            self.bead_atom_selection[tag3] = self.bead_atom_selection[n]
+            self.bead_types[tag3] = self.bead_types[n]
+            self.bead_atom_names[tag3] = self.bead_atom_names[n]
+            self.bead_masses[tag3] = self.bead_masses[n]
+            self.bead_backbone_idx[tag3] = self.bead_backbone_idx[n]
+
+        # Extend embeddings. We don't reuse the protein indices because the
+        # GNN benefits from disjoint type IDs across polymer classes.
+        max_protein_emb = max(v[0] for v in self.bead_embeddings.values())
+        next_idx = max_protein_emb + 1
+        new_embeddings: dict[str, list[int]] = {}
+        for n in dna_residues:
+            for tag in (n, n + "5", n + "3"):
+                new_embeddings[tag] = [next_idx]
+            next_idx += 1
+        self.bead_embeddings.update(new_embeddings)
+
+
 class CGMappingDef_CACB:
     def __init__(self):
         residues = ["ALA", "CYS", "ASP", "GLU", "PHE", "GLY", "HIS", "ILE", "LYS", "LEU", "MET", "ASN", "PRO", "HYP", "GLN", "ARG", "SER", "THR", "VAL", "TRP", "TYR"]
@@ -163,7 +222,11 @@ class PriorBuilder:
                 f.write("ok")
 
     def load_molecule_cache(self, cache_dir):
-        assert os.path.exists(os.path.join(cache_dir, "fit_ok.txt"))
+        # cgff: skip systems whose prior fit failed (no fit_ok.txt) instead
+        # of crashing the whole batch. Caller tracks failures via errorList.
+        if not os.path.exists(os.path.join(cache_dir, "fit_ok.txt")):
+            print(f"  load_molecule_cache: skipping {cache_dir} (no fit_ok.txt)")
+            return
         atomtype = np.load(os.path.join(cache_dir, "atomtype.npy"), allow_pickle=True)
         self.atom_types = self.atom_types.union(atomtype)
 
@@ -262,6 +325,35 @@ class Prior_CA(PriorBuilder):
         dihedrals = "dihedrals" in self.terms
         return psfwriter.pdb2psf_CA(pdb_file, psf_file, bonds = bonds, angles = angles, dihedrals = dihedrals,
                                     tag_beta_turns = self.tag_beta_turns)
+
+class Prior_CA_DNA(Prior_CA):
+    """cgff DNA-extended prior: Ca for protein + P for DNA, bonds only.
+
+    Inherits the bond prior fit from Prior_CA. The only difference is the
+    CG map_def used to build the topology (CGMappingDef_CA_DNA).
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.prior_params["prior_configuration_name"] = "CA_DNA"
+
+    def build_mapping(self, topology):
+        return CGMapping(topology, CGMappingDef_CA_DNA())
+
+    def map_embeddings(self, selected_atoms, topology):  # pyright: ignore[reportIncompatibleMethodOverride]
+        # Use the CGMappingDef's embedding table so DNA residues get distinct ids.
+        map_def = CGMappingDef_CA_DNA()
+        result = []
+        for a_idx in selected_atoms:
+            r_name = topology.atom(a_idx).residue.name
+            if r_name not in map_def.bead_embeddings:
+                raise KeyError(
+                    f"Residue {r_name} not in CGMappingDef_CA_DNA.bead_embeddings; "
+                    f"add it to the map_def or rename the residue."
+                )
+            result.append(map_def.bead_embeddings[r_name][0])
+        return np.array(result, dtype=int)
+
 
 class Prior_CACB(PriorBuilder):
     """Implements the torchmd-cg CACB prior"""
@@ -986,6 +1078,7 @@ def gen_input_mapping(conf):
 
 prior_types = {
     "CA":Prior_CA,
+    "CA_DNA":Prior_CA_DNA,
     "CACB":Prior_CACB,
     "CACB_lj":Prior_CACB_lj,
     "CACB_lj_angle_dihedral":Prior_CACB_lj_angle_dihedral,
