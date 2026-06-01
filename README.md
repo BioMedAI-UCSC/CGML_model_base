@@ -279,6 +279,77 @@ python simulate.py \
 - **HDF5 format** (`.h5`): Compact binary format with energies and metadata
 - **Pickle format** (`.pkl`): Contains MDTraj trajectory objects for analysis
 
+## Weighted Force Matching (WESTPA Ensembles)
+
+Standard force matching weights every frame equally. When training data
+comes from a weighted-ensemble sampler such as WESTPA, each walker carries
+a probability weight that should multiply its contribution to the loss —
+otherwise rare-event walkers (low weight) get the same gradient pull as
+equilibrium walkers (high weight) and the resulting model under-confines
+the equilibrium basin.
+
+The pipeline is three stages:
+
+### Stage 1 — Convert each WESTPA run to a weighted h5
+
+```bash
+python convert_westpa.py \
+    --westpa-dir /path/to/westpa_prop \
+    --base-traj /path/to/topology.pdb \
+    --output /path/to/staged/1PGB_run1.h5 \
+    --protein-name 1PGB \
+    --num-workers 16 \
+    --min-weight 1e-5
+```
+
+The output h5 contains `coordinates`, `forces`, `time`, and `weight`
+(per-frame walker weight). Run with `--force` to re-convert; otherwise
+existing complete outputs are skipped.
+
+### Stage 2 — (optional) Merge multiple WESTPA runs per pdbid
+
+If a pdbid has been simulated under multiple WESTPA runs (e.g. different
+starting points), merge them into one combined h5:
+
+```bash
+python merge_westpa_h5.py \
+    --inputs /path/to/staged/1PGB_run1.h5 /path/to/staged/1PGB_run2.h5 \
+    --output /path/to/staged/1PGB.h5 \
+    --normalize per-run
+```
+
+Normalization modes:
+- `per-run` (default): each run is rescaled to mean(weight)=1 so all runs
+  contribute equally on average. Use this when runs differ in length
+  or sample different basins.
+- `global`: concatenate raw weights then rescale to mean=1. Runs with
+  more frames carry more total weight.
+- `none`: pass weights through as-is. Use only when the input runs
+  already share a normalization convention.
+
+If you only have one WESTPA run per pdbid, skip this stage and feed the
+Stage 1 output directly to preprocess.
+
+### Stage 3 — Preprocess + train
+
+`preprocess.py` automatically detects the `weight` dataset in the input
+h5 and writes a per-bead `forces_weights.npy` alongside `forces.npy`
+in each pdbid's `raw/` directory. No new flag is needed for preprocess.
+
+Then enable weighted FM in training:
+
+```bash
+python train.py /path/to/preprocessed_data /path/to/run_dir \
+    --use-force-weights \
+    --force-weight 1.0 \
+    ...
+```
+
+With `--use-force-weights`, the per-batch force loss becomes
+`mean(weight * (pred - target)^2)` instead of `mean((pred - target)^2)`.
+When all weights equal 1 the two are mathematically identical, so
+runs without WESTPA data behave the same way.
+
 ## Utilities
 
 ### Editing Checkpoints

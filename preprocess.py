@@ -834,7 +834,7 @@ class Preprocessor:
 
         print("Done!")
 
-    def save_data(self, output_path, trajectory, embeddings, forces, pdbid):
+    def save_data(self, output_path, trajectory, embeddings, forces, pdbid, weights=None):
         # print(f"  {pdbid} (coordinates, forces): {trajectory.xyz.shape}, {forces.shape}")
         np.save(f"{output_path}/raw/embeddings.npy", embeddings)
         np.save(f"{output_path}/raw/forces.npy", forces)
@@ -844,6 +844,15 @@ class Preprocessor:
             np.save(box_path, trajectory.unitcell_vectors)
         elif os.path.exists(box_path):
             os.unlink(box_path)
+
+        # Per-frame weighted force matching (e.g. WESTPA walker weights).
+        # Stored as a per-bead array so the train loop can multiply the
+        # element-wise (no-reduction) MSE before averaging.
+        weights_path = f"{output_path}/raw/forces_weights.npy"
+        if weights is not None:
+            np.save(weights_path, weights)
+        elif os.path.exists(weights_path):
+            os.unlink(weights_path)
 
     def process_step1(self, pdbid, bar_position=0):
         """Generate the course grained data and topology for the protein, then add it to the prior builder"""
@@ -875,8 +884,9 @@ class Preprocessor:
             mol.write(f'{output_path}/processed/{pdbid}_processed.psf')
             topology.write(f'{output_path}/processed/topology.psf')  # Save the topology for the CG mapping, this is optional but useful for debugging
 
-            # Get the forces
+            # Get the forces (and optional per-frame weights for weighted FM)
             progress_bar_step("Mapping CG forces")
+            aa_weights = None
             with h5py.File(input_file_path, "r") as f:
                 forces = f["forces"][self.frame_slice, :, :] #pyright: ignore[reportIndexIssue]
 
@@ -888,6 +898,24 @@ class Preprocessor:
                 assert len(forces) == len(AAtraj)
                 # Convert from kilojoules/mole/nanometer to kilocalories/mole/angstrom
                 forces = forces*0.02390057361376673
+
+                if "weight" in f.keys():
+                    aa_weights = f["weight"][self.frame_slice][:] #pyright: ignore[reportIndexIssue]
+
+            cg_weights = None
+            if aa_weights is not None:
+                n_cg_beads = len(cg_map.src_idx)
+                if aa_weights.ndim == 2:        # (n_frames, n_aa_atoms) -> per-bead mean
+                    cg_weights = cg_map.cg_weights(aa_weights)
+                elif aa_weights.ndim == 1:      # (n_frames,) -> broadcast across beads
+                    cg_weights = np.repeat(
+                        aa_weights[:, np.newaxis], n_cg_beads, axis=1
+                    ).astype(np.float32)
+                else:
+                    raise ValueError(
+                        f"{pdbid}: unsupported 'weight' shape {aa_weights.shape}; "
+                        "expected (n_frames,) or (n_frames, n_aa_atoms)."
+                    )
 
             progress_bar_step("Mapping CG coordinates")
             xyz = cg_map.cg_positions(AAtraj.xyz)
@@ -901,7 +929,7 @@ class Preprocessor:
 
             # Save the data
             progress_bar_step("Saving Data")
-            self.save_data(output_path, cg_traj, cg_map.embeddings, forces, pdbid)
+            self.save_data(output_path, cg_traj, cg_map.embeddings, forces, pdbid, weights=cg_weights)
 
             # Note: moveaxis creates a view, the original trajectory.xyz is unmodified
             assert cg_traj.xyz is not None

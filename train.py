@@ -195,7 +195,7 @@ def train_model(directory_path, conf_path, result_directory, dry_run, gpu_ids,
                 weight_decay, learning_rate, epochs, batch_size, val_ratio, atoms_per_call,
                 scheduler, reset_early_stopping, enable_shuffle, mini_epoch_size, early_stopping,
                 checkpoint_save, subsetpdbs, energy_weight, force_weight, energy_matching, train_term_def,
-                embedding_filename, dataset_chunk_size, use_npfile):
+                embedding_filename, dataset_chunk_size, use_npfile, use_force_weights=False):
 
     with open(os.path.join(directory_path, "result", subsetpdbs), 'r') as file:
         pdb_list = file.read().split('\n')
@@ -284,6 +284,11 @@ def train_model(directory_path, conf_path, result_directory, dry_run, gpu_ids,
         extra_train_terms.extend(harmonic_trained_terms)
         print(f"    Term Scales:     {[train_term_def.get_scale(i) for i in harmonic_trained_terms]}")
         print(f"    Term Angle Wrap: {[train_term_def.get_angle_wrap(i) for i in harmonic_trained_terms]}")
+
+    if use_force_weights:
+        print("Loading per-frame force weights (forces_weights.npy)...")
+        for d in datasets:
+            d.load_frame_terms(["forces_weights"])
 
     print()
 
@@ -493,6 +498,12 @@ def train_model(directory_path, conf_path, result_directory, dry_run, gpu_ids,
             for sub_batch in batch:
                 force = sub_batch.pop("force")
                 force = force.reshape(-1, force.shape[-1]).to(device_output)
+
+                force_weights = None
+                if use_force_weights:
+                    force_weights = sub_batch.pop("forces_weights")
+                    force_weights = force_weights.reshape(-1).to(device_output)
+
                 energy = None
                 if energy_matching:
                     energy = sub_batch.pop("energy")
@@ -509,7 +520,13 @@ def train_model(directory_path, conf_path, result_directory, dry_run, gpu_ids,
                 energy_loss: torch.Tensor = torch.tensor(0.0)
                 if energy_matching:
                     energy_loss = criterion(out_energy, energy) * (sub_batch_size / total_batch_size)
-                force_loss = criterion(out_force, force) * (sub_batch_size / total_batch_size)
+                if force_weights is not None:
+                    # Element-wise MSE then per-bead weight, then mean -> matches the
+                    # unweighted code path when all weights equal 1.
+                    force_loss = term_criterion(out_force, force) * force_weights[:, None]
+                    force_loss = force_loss.mean() * (sub_batch_size / total_batch_size)
+                else:
+                    force_loss = criterion(out_force, force) * (sub_batch_size / total_batch_size)
                 loss = energy_weight * energy_loss + force_weight * force_loss
 
                 train_force_loss += force_loss.item() * total_batch_size
@@ -581,6 +598,12 @@ def train_model(directory_path, conf_path, result_directory, dry_run, gpu_ids,
             for sub_batch in batch:
                 force = sub_batch.pop("force")
                 force = force.reshape(-1, force.shape[-1]).to(device_output)
+
+                force_weights = None
+                if use_force_weights:
+                    force_weights = sub_batch.pop("forces_weights")
+                    force_weights = force_weights.reshape(-1).to(device_output)
+
                 energy = None
                 if energy_matching:
                     energy = sub_batch.pop("energy")
@@ -596,7 +619,11 @@ def train_model(directory_path, conf_path, result_directory, dry_run, gpu_ids,
                 energy_loss: torch.Tensor = torch.tensor(0.0)
                 if energy_matching:
                     energy_loss = criterion(out_energy, energy) * (sub_batch_size / total_batch_size)
-                force_loss = criterion(out_force, force) * (sub_batch_size / total_batch_size)
+                if force_weights is not None:
+                    force_loss = term_criterion(out_force, force) * force_weights[:, None]
+                    force_loss = force_loss.mean() * (sub_batch_size / total_batch_size)
+                else:
+                    force_loss = criterion(out_force, force) * (sub_batch_size / total_batch_size)
                 loss = energy_weight * energy_loss + force_weight * force_loss
 
                 val_loss += loss.item() * total_batch_size
@@ -719,6 +746,17 @@ if __name__ == "__main__":
     parser.add_argument("--embedding", type=str, default=None, help="Specify an alternate file to load embeddings from (default: embeddings.npy).")
     parser.add_argument("--chunk-dataset", type=int, default=None, help="Break the dataset into chunks of n proteins per batch")
     parser.add_argument("--npfile", action="store_true", help="Use file loader instead of mmap to load dataset")
+    parser.add_argument(
+        "--use-force-weights",
+        action="store_true",
+        help=(
+            "Apply per-frame, per-bead sample weights to the force-matching loss. "
+            "Weights are loaded from each system's raw/forces_weights.npy (written "
+            "by preprocess.py when the input h5 contains a 'weight' dataset, e.g. "
+            "from a WESTPA conversion). With this flag, force_loss reduces to "
+            "mean(w * (pred-target)^2) instead of mean((pred-target)^2)."
+        ),
+    )
 
     assert torch.cuda.is_available(), "CUDA is not available, please run on a machine with CUDA or use --gpus cpu"
 
@@ -758,6 +796,7 @@ if __name__ == "__main__":
     embedding_filename = args.embedding
     dataset_chunk_size = args.chunk_dataset
     use_npfile = args.npfile
+    use_force_weights = args.use_force_weights
 
     # Relax the maximum number of open files as much as possible
     # We will potentially open a lot of files (~4 per molecule per ProteinDataset object)
@@ -793,7 +832,7 @@ if __name__ == "__main__":
                     atoms_per_call=atoms_per_call, reset_early_stopping=reset_early_stopping, enable_shuffle=enable_shuffle,
                     mini_epoch_size=mini_epoch_size, early_stopping=early_stopping, checkpoint_save=checkpoint_save, subsetpdbs=subsetpdbs, energy_weight=energy_weight,
                     force_weight=force_weight, energy_matching=energy_matching, train_term_def=train_term_def, embedding_filename=embedding_filename,
-                    dataset_chunk_size=dataset_chunk_size, use_npfile=use_npfile)
+                    dataset_chunk_size=dataset_chunk_size, use_npfile=use_npfile, use_force_weights=use_force_weights)
     except Exception as e:
         # Uncaught exceptions cause pytorch to hang for quite a while before exiting
         traceback.print_tb(e.__traceback__)
