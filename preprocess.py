@@ -143,6 +143,59 @@ class CGMappingDef_CA_DNA(CGMappingDef_CA):
         self.bead_embeddings.update(new_embeddings)
 
 
+class CGMappingDef_CA_DNA_RNA(CGMappingDef_CA_DNA):
+    """cgff RNA extension on top of CA_DNA.
+
+    Adds RNA nucleotides under the AMBER OL3 convention, which uses the
+    single-letter residue names A/C/G/U (vs DA/DC/DG/DT for DNA). One P
+    bead per nucleotide, same as the DNA mapping. Embeddings continue
+    past the DNA indices so RNA gets distinct type IDs from both
+    protein and DNA.
+
+    Bead type names use the prefix "R" (RA/RC/RG/RU) to keep the type
+    namespace disjoint from the DNA "P*"-prefixed types.
+    """
+
+    def __init__(self):
+        super().__init__()
+        rna_residues = ("A", "C", "G", "U")
+
+        for n in rna_residues:
+            self.bead_atom_selection[n] = [["P"]]
+            self.bead_types[n] = [f"R{n}"]
+            self.bead_atom_names[n] = ["P"]
+            self.bead_masses[n] = [30.97]   # phosphorus
+            self.bead_backbone_idx[n] = 0
+
+        # 5'-terminal nucleotides lack a P atom; fall back to O5' so the
+        # chain still gets a bead. 3'-terminal variants keep P and are
+        # identical to the canonical residue.
+        for n in rna_residues:
+            tag5 = n + "5"
+            self.bead_atom_selection[tag5] = [["O5'"]]
+            self.bead_types[tag5] = [f"R{n}5"]
+            self.bead_atom_names[tag5] = ["P"]
+            self.bead_masses[tag5] = [16.00]   # oxygen
+            self.bead_backbone_idx[tag5] = 0
+
+            tag3 = n + "3"
+            self.bead_atom_selection[tag3] = self.bead_atom_selection[n]
+            self.bead_types[tag3] = self.bead_types[n]
+            self.bead_atom_names[tag3] = self.bead_atom_names[n]
+            self.bead_masses[tag3] = self.bead_masses[n]
+            self.bead_backbone_idx[tag3] = self.bead_backbone_idx[n]
+
+        # Extend embeddings past whatever DNA already used. All variants
+        # of the same nucleotide share an embedding id, matching the
+        # protein/DNA convention.
+        max_existing_emb = max(v[0] for v in self.bead_embeddings.values())
+        next_idx = max_existing_emb + 1
+        for n in rna_residues:
+            for tag in (n, n + "5", n + "3"):
+                self.bead_embeddings[tag] = [next_idx]
+            next_idx += 1
+
+
 class CGMappingDef_CACB:
     def __init__(self):
         residues = ["ALA", "CYS", "ASP", "GLU", "PHE", "GLY", "HIS", "ILE", "LYS", "LEU", "MET", "ASN", "PRO", "HYP", "GLN", "ARG", "SER", "THR", "VAL", "TRP", "TYR"]
@@ -349,6 +402,35 @@ class Prior_CA_DNA(Prior_CA):
             if r_name not in map_def.bead_embeddings:
                 raise KeyError(
                     f"Residue {r_name} not in CGMappingDef_CA_DNA.bead_embeddings; "
+                    f"add it to the map_def or rename the residue."
+                )
+            result.append(map_def.bead_embeddings[r_name][0])
+        return np.array(result, dtype=int)
+
+
+class Prior_CA_DNA_RNA(Prior_CA_DNA):
+    """cgff RNA-extended prior: Ca for protein + P for DNA + P for RNA, bonds only.
+
+    Inherits the bond prior fit from Prior_CA. Differs from Prior_CA_DNA
+    only in the CG map_def, which adds AMBER OL3 single-letter A/C/G/U
+    residues alongside the DA/DC/DG/DT DNA residues.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.prior_params["prior_configuration_name"] = "CA_DNA_RNA"
+
+    def build_mapping(self, topology):
+        return CGMapping(topology, CGMappingDef_CA_DNA_RNA())
+
+    def map_embeddings(self, selected_atoms, topology):  # pyright: ignore[reportIncompatibleMethodOverride]
+        map_def = CGMappingDef_CA_DNA_RNA()
+        result = []
+        for a_idx in selected_atoms:
+            r_name = topology.atom(a_idx).residue.name
+            if r_name not in map_def.bead_embeddings:
+                raise KeyError(
+                    f"Residue {r_name} not in CGMappingDef_CA_DNA_RNA.bead_embeddings; "
                     f"add it to the map_def or rename the residue."
                 )
             result.append(map_def.bead_embeddings[r_name][0])
@@ -1079,6 +1161,7 @@ def gen_input_mapping(conf):
 prior_types = {
     "CA":Prior_CA,
     "CA_DNA":Prior_CA_DNA,
+    "CA_DNA_RNA":Prior_CA_DNA_RNA,
     "CACB":Prior_CACB,
     "CACB_lj":Prior_CACB_lj,
     "CACB_lj_angle_dihedral":Prior_CACB_lj_angle_dihedral,
