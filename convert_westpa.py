@@ -90,35 +90,70 @@ def _segment_paths(westpa_dir: str, iter_num: int, walker_idx: int) -> tuple[str
 
 
 _GLOBAL_TOPOLOGY = None  # set in worker via _init_worker
+_GLOBAL_SEL = None       # atom indices into the full topology; None = keep all
 
-def _init_worker(topology_pickle_path: str):
-    """Each worker loads the topology once; mdtraj topology is not picklable
-    by default. We round-trip via pdb so workers don't reload per-segment."""
-    global _GLOBAL_TOPOLOGY
+def _init_worker(topology_pickle_path: str, sel_indices):
+    """Each worker loads the (full, pdbfixed) topology once and stores the
+    output-slice indices. mdtraj topology is not picklable; we round-trip via
+    pdb so workers don't reload per-segment."""
+    global _GLOBAL_TOPOLOGY, _GLOBAL_SEL
     _GLOBAL_TOPOLOGY = md.load_topology(topology_pickle_path)
+    _GLOBAL_SEL = None if sel_indices is None else np.asarray(sel_indices, dtype=np.int64)
 
 
 def _load_segment(task: tuple):
-    """Worker: load one (dcd, npz) segment, return (idx, coords_A, forces, n_frames, cell_lengths, cell_angles)."""
+    """Worker: load one (dcd, npz) segment, slice to output atoms, return
+    (idx, coords_A, forces, n_frames, cell_lengths, cell_angles)."""
     seq_idx, iter_num, walker_idx, weight, dcd_path, npz_path = task
     seg_traj = md.load(dcd_path, top=_GLOBAL_TOPOLOGY)
-    coords = (seg_traj.xyz * 10.0).astype(np.float32)            # nm -> angstrom
+    coords_full = (seg_traj.xyz * 10.0).astype(np.float32)       # nm -> angstrom
     seg_data = np.load(npz_path)
-    forces = seg_data["forces"].astype(np.float32)
-    if forces.shape[0] != coords.shape[0]:
+    forces_full = seg_data["forces"].astype(np.float32)
+    if forces_full.shape[0] != coords_full.shape[0]:
         raise RuntimeError(
             f"iter={iter_num} walker={walker_idx}: frame count mismatch "
-            f"coords={coords.shape[0]} forces={forces.shape[0]}"
+            f"coords={coords_full.shape[0]} forces={forces_full.shape[0]}"
         )
-    if forces.shape[1] != coords.shape[1]:
+    if forces_full.shape[1] != coords_full.shape[1]:
         raise RuntimeError(
             f"iter={iter_num} walker={walker_idx}: atom count mismatch "
-            f"coords={coords.shape[1]} forces={forces.shape[1]}"
+            f"coords={coords_full.shape[1]} forces={forces_full.shape[1]}"
         )
+    if _GLOBAL_SEL is not None:
+        coords = coords_full[:, _GLOBAL_SEL, :]
+        forces = forces_full[:, _GLOBAL_SEL, :]
+    else:
+        coords, forces = coords_full, forces_full
     n_frames = coords.shape[0]
     cell_lengths = seg_traj.unitcell_lengths.astype(np.float32) if seg_traj.unitcell_lengths is not None else None
     cell_angles = seg_traj.unitcell_angles.astype(np.float32) if seg_traj.unitcell_angles is not None else None
     return seq_idx, weight, n_frames, coords, forces, cell_lengths, cell_angles
+
+
+def _build_expanded_topology(base_pdb_path: str, ph: float = 7.0):
+    """Mirror the propagator's PDBFixer step (findMissingResidues/Atoms +
+    addMissingAtoms + addMissingHydrogens) so the resulting mdtraj topology
+    has the same atom count as the trajectory DCDs written by OpenMM."""
+    try:
+        from pdbfixer import PDBFixer
+    except ImportError as e:
+        raise ImportError(
+            "pdbfixer is required to expand the base PDB to the simulated topology."
+        ) from e
+    import tempfile
+    from openmm.app import PDBFile as _PDBFile
+    fixer = PDBFixer(filename=base_pdb_path)
+    fixer.findMissingResidues()
+    fixer.findMissingAtoms()
+    fixer.addMissingAtoms()
+    fixer.addMissingHydrogens(ph)
+    with tempfile.NamedTemporaryFile(suffix=".pdb", delete=False) as tf:
+        tmp_path = tf.name
+    with open(tmp_path, "w") as fh:
+        _PDBFile.writeFile(fixer.topology, fixer.positions, fh, keepIds=True)
+    expanded = md.load(tmp_path)
+    os.unlink(tmp_path)
+    return expanded
 
 
 def _build_segment_tasks(west_h5_path: str, westpa_dir: str, skip_iters: int,
@@ -175,18 +210,21 @@ def main():
     if not os.path.exists(west_h5):
         sys.exit(f"west.h5 not found in {args.westpa_dir}")
 
-    print(f"[{args.protein_name}] Loading base trajectory: {args.base_traj}")
-    base = md.load(args.base_traj)
-    sel = base.topology.select(args.atom_selection)
+    print(f"[{args.protein_name}] Building expanded topology (pdbfixer) from: {args.base_traj}")
+    expanded = _build_expanded_topology(args.base_traj)
+    sel = expanded.topology.select(args.atom_selection)
     if len(sel) == 0:
-        sys.exit(f"atom-selection '{args.atom_selection}' matched 0 atoms in {args.base_traj}")
-    base_sliced = base.atom_slice(sel)
-    n_atoms = base_sliced.n_atoms
+        sys.exit(f"atom-selection '{args.atom_selection}' matched 0 atoms in expanded {args.base_traj}")
+    n_atoms = int(len(sel))
+    print(f"[{args.protein_name}] expanded topology = {expanded.n_atoms} atoms; "
+          f"output slice ('{args.atom_selection}') = {n_atoms} atoms")
 
-    # Stash a topology PDB the workers can load (mdtraj topology is not picklable).
+    # Stash the FULL (pdbfixed) topology so workers can load DCDs; slicing
+    # to the output atom set happens after load.
     os.makedirs(os.path.dirname(os.path.abspath(args.output)) or ".", exist_ok=True)
     topo_path = args.output + ".topology.pdb"
-    base_sliced.save_pdb(topo_path)
+    expanded.save_pdb(topo_path)
+    sel_indices = None if n_atoms == expanded.n_atoms else sel.tolist()
 
     print(f"[{args.protein_name}] Enumerating segments...")
     tasks, skipped, stop_iter = _build_segment_tasks(
@@ -236,7 +274,7 @@ def main():
 
         with ProcessPoolExecutor(
             max_workers=n_workers,
-            initializer=_init_worker, initargs=(topo_path,),
+            initializer=_init_worker, initargs=(topo_path, sel_indices),
         ) as pool:
             futures = [pool.submit(_load_segment, t) for t in tasks]
             with tqdm.tqdm(total=len(tasks), desc=f"{args.protein_name}: convert") as pbar:
