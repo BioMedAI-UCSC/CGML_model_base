@@ -50,6 +50,11 @@ def _parse_args():
         help="Base topology file (PDB) used as the mdtraj topology. Selection 'protein' is applied.",
     )
     parser.add_argument(
+        "--simulated-topology", default=None,
+        help="PDB matching the propagator's post-prep atom set (matches DCDs). "
+             "Defaults to {westpa_dir}/simulated_topology.pdb when present.",
+    )
+    parser.add_argument(
         "--output", required=True,
         help="Output .h5 path.",
     )
@@ -106,7 +111,7 @@ def _load_segment(task: tuple):
     (idx, coords_A, forces, n_frames, cell_lengths, cell_angles)."""
     seq_idx, iter_num, walker_idx, weight, dcd_path, npz_path = task
     seg_traj = md.load(dcd_path, top=_GLOBAL_TOPOLOGY)
-    coords_full = (seg_traj.xyz * 10.0).astype(np.float32)       # nm -> angstrom
+    coords_full = seg_traj.xyz.astype(np.float32)                 # nanometers (mdtraj convention)
     seg_data = np.load(npz_path)
     forces_full = seg_data["forces"].astype(np.float32)
     if forces_full.shape[0] != coords_full.shape[0]:
@@ -210,8 +215,13 @@ def main():
     if not os.path.exists(west_h5):
         sys.exit(f"west.h5 not found in {args.westpa_dir}")
 
-    print(f"[{args.protein_name}] Building expanded topology (pdbfixer) from: {args.base_traj}")
-    expanded = _build_expanded_topology(args.base_traj)
+    sim_top_path = args.simulated_topology or os.path.join(args.westpa_dir, "simulated_topology.pdb")
+    if os.path.exists(sim_top_path):
+        print(f"[{args.protein_name}] Loading propagator-prepared topology: {sim_top_path}")
+        expanded = md.load(sim_top_path)
+    else:
+        print(f"[{args.protein_name}] simulated_topology.pdb not found; falling back to pdbfixer on {args.base_traj}")
+        expanded = _build_expanded_topology(args.base_traj)
     sel = expanded.topology.select(args.atom_selection)
     if len(sel) == 0:
         sys.exit(f"atom-selection '{args.atom_selection}' matched 0 atoms in expanded {args.base_traj}")
@@ -247,31 +257,22 @@ def main():
     frame_offset = 0
     n_workers = max(1, args.num_workers)
 
-    with h5py.File(tmp_out, "w") as fout:
-        coords_dset = fout.create_dataset(
-            "coordinates", shape=(0, n_atoms, 3),
-            maxshape=(None, n_atoms, 3), dtype="float32", chunks=True,
-        )
-        forces_dset = fout.create_dataset(
-            "forces", shape=(0, n_atoms, 3),
-            maxshape=(None, n_atoms, 3), dtype="float32", chunks=True,
-        )
-        forces_dset.attrs["units"] = "kilojoules/mole/nanometer"
-        weight_dset = fout.create_dataset(
-            "weight", shape=(0,), maxshape=(None,), dtype="float32", chunks=True,
-        )
-        time_dset = fout.create_dataset(
-            "time", shape=(0,), maxshape=(None,), dtype="float32", chunks=True,
-        )
-        cell_lengths_dset = None
-        cell_angles_dset = None
+    # Two-phase write: phase 1 streams coords/time/cell via HDF5TrajectoryFile
+    # (mdtraj-compatible: writes topology, units, Pande conventions). Phase 2
+    # appends forces/weight (and our protein_name/etc. attrs) via h5py.
+    from mdtraj.formats import HDF5TrajectoryFile
+    # Build the output-slice topology so the on-disk topology matches the
+    # coordinates after _GLOBAL_SEL slicing.
+    output_topology = expanded.atom_slice(sel).topology if sel_indices is not None else expanded.topology
 
-        fout.attrs["protein_name"] = args.protein_name
-        fout.attrs["westpa_dir"] = os.path.abspath(args.westpa_dir)
-        fout.attrs["stop_iter"] = stop_iter
-        fout.attrs["min_weight"] = args.min_weight
-        fout.attrs["atom_selection"] = args.atom_selection
+    # We need forces+weight buffered to write after phase 1; for typical runs
+    # this is a few hundred MB at most.
+    all_forces = []
+    all_weights = []
 
+    h5traj = HDF5TrajectoryFile(tmp_out, "w")
+    h5traj.topology = output_topology
+    try:
         with ProcessPoolExecutor(
             max_workers=n_workers,
             initializer=_init_worker, initargs=(topo_path, sel_indices),
@@ -281,35 +282,35 @@ def main():
                 for fut in as_completed(futures):
                     seq_idx, weight, n_f, coords, forces, cell_l, cell_a = fut.result()
                     pending[seq_idx] = (weight, n_f, coords, forces, cell_l, cell_a)
-                    # Flush as many in-order results as we can.
                     while next_seq in pending:
                         weight, n_f, coords, forces, cell_l, cell_a = pending.pop(next_seq)
-                        new_size = frame_offset + n_f
-                        coords_dset.resize(new_size, axis=0)
-                        forces_dset.resize(new_size, axis=0)
-                        weight_dset.resize(new_size, axis=0)
-                        time_dset.resize(new_size, axis=0)
-                        coords_dset[frame_offset:new_size] = coords
-                        forces_dset[frame_offset:new_size] = forces
-                        weight_dset[frame_offset:new_size] = np.full(n_f, weight, dtype=np.float32)
-                        time_dset[frame_offset:new_size] = np.arange(frame_offset, new_size, dtype=np.float32)
-                        if cell_l is not None:
-                            if cell_lengths_dset is None:
-                                cell_lengths_dset = fout.create_dataset(
-                                    "cell_lengths", shape=(0, 3),
-                                    maxshape=(None, 3), dtype="float32", chunks=True,
-                                )
-                                cell_angles_dset = fout.create_dataset(
-                                    "cell_angles", shape=(0, 3),
-                                    maxshape=(None, 3), dtype="float32", chunks=True,
-                                )
-                            cell_lengths_dset.resize(new_size, axis=0)
-                            cell_angles_dset.resize(new_size, axis=0)
-                            cell_lengths_dset[frame_offset:new_size] = cell_l
-                            cell_angles_dset[frame_offset:new_size] = cell_a
-                        frame_offset = new_size
+                        times = np.arange(frame_offset, frame_offset + n_f, dtype=np.float32)
+                        h5traj.write(
+                            coordinates=coords, time=times,
+                            cell_lengths=cell_l, cell_angles=cell_a,
+                        )
+                        all_forces.append(forces)
+                        all_weights.append(np.full(n_f, weight, dtype=np.float32))
+                        frame_offset += n_f
                         next_seq += 1
                         pbar.update(1)
+    finally:
+        h5traj.close()
+
+    # Phase 2: append forces/weight + our manifest-like attrs via h5py.
+    all_forces = np.concatenate(all_forces, axis=0)
+    all_weights = np.concatenate(all_weights, axis=0)
+    with h5py.File(tmp_out, "a") as fout:
+        forces_dset = fout.create_dataset(
+            "forces", data=all_forces, dtype="float32", chunks=True,
+        )
+        forces_dset.attrs["units"] = "kilojoules/mole/nanometer"
+        fout.create_dataset("weight", data=all_weights, dtype="float32", chunks=True)
+        fout.attrs["protein_name"] = args.protein_name
+        fout.attrs["westpa_dir"] = os.path.abspath(args.westpa_dir)
+        fout.attrs["stop_iter"] = stop_iter
+        fout.attrs["min_weight"] = args.min_weight
+        fout.attrs["atom_selection"] = args.atom_selection
 
     os.replace(tmp_out, args.output)
 
