@@ -295,6 +295,22 @@ def train_model(directory_path, conf_path, result_directory, dry_run, gpu_ids,
     criterion = nn.MSELoss()
     term_criterion = nn.MSELoss(reduction="none")
 
+    dsm_enabled = args.dsm_weight > 0
+    if dsm_enabled:
+        sys.path.insert(0, "/u/awaghili/FoundationModel")
+        from cgff.extensions.dsm.schedule import GaussianNoiseSchedule
+        from cgff.extensions.dsm.loss import kT_kJmol
+        dsm_schedule = GaussianNoiseSchedule(
+            sigma_min_nm=args.dsm_sigma_min,
+            sigma_max_nm=args.dsm_sigma_max,
+            n_levels=args.dsm_n_levels,
+        )
+        dsm_kT = kT_kJmol(args.dsm_temperature)
+        dsm_weight = args.dsm_weight
+        print(f"[DSM] enabled weight={dsm_weight} "
+              f"sigma=[{args.dsm_sigma_min},{args.dsm_sigma_max}] nm "
+              f"K={args.dsm_n_levels} T={args.dsm_temperature}K kT={dsm_kT:.4f} kJ/mol")
+
     do_decay = []
     dont_decay = []
     for name, param in model.named_parameters():
@@ -529,6 +545,30 @@ def train_model(directory_path, conf_path, result_directory, dry_run, gpu_ids,
                     force_loss = criterion(out_force, force) * (sub_batch_size / total_batch_size)
                 loss = energy_weight * energy_loss + force_weight * force_loss
 
+                if dsm_enabled:
+                    # Sample one sigma per sample in this sub_batch (pos: [B,N,3]).
+                    pos_cur = sub_batch["pos"]
+                    B = pos_cur.shape[0]
+                    sigma_b = dsm_schedule.sample(B).to(pos_cur.device, pos_cur.dtype)
+                    # Broadcast to [B,1,1] so noise/target use per-sample sigma.
+                    sigma_bcast = sigma_b.view(B, 1, 1)
+                    noise = torch.randn(pos_cur.shape, device=pos_cur.device, dtype=pos_cur.dtype) * sigma_bcast
+                    noisy_batch = dict(sub_batch)
+                    noisy_batch["pos"] = pos_cur + noise
+                    out_noisy = parallel_model(**noisy_batch)
+                    noisy_force = out_noisy[1] if isinstance(out_noisy, (tuple, list)) else out_noisy["out_force"]
+                    # noisy_force comes back on the compute device (cuda); align all DSM tensors to it.
+                    dev = noisy_force.device
+                    N_per = pos_cur.shape[1]
+                    sigma_per_node = sigma_b.to(dev).repeat_interleave(N_per).view(-1, 1)
+                    target = -dsm_kT * noise.reshape(-1, 3).to(dev) / (sigma_per_node ** 2).clamp_min(1e-12)
+                    diff = noisy_force - target
+                    sq = diff.pow(2).sum(dim=-1)
+                    # Karras-style w(sigma) = sigma^2 to keep loss comparable across scales.
+                    weight_per_node = (sigma_per_node.squeeze(-1) ** 2)
+                    dsm_term = dsm_weight * (weight_per_node * sq).mean() * (sub_batch_size / total_batch_size)
+                    loss = loss + dsm_term
+
                 train_force_loss += force_loss.item() * total_batch_size
                 if energy_matching:
                     train_energy_loss += (energy_loss.item() * total_batch_size)
@@ -757,10 +797,18 @@ if __name__ == "__main__":
             "mean(w * (pred-target)^2) instead of mean((pred-target)^2)."
         ),
     )
-
-    assert torch.cuda.is_available(), "CUDA is not available, please run on a machine with CUDA or use --gpus cpu"
+    # cgff DSM extension (Durumeric 2026). Default weight 0 = fully disabled = pure FM.
+    parser.add_argument("--dsm-weight", type=float, default=0.0, help="Additive DSM loss weight (0 = disabled).")
+    parser.add_argument("--dsm-sigma-min", type=float, default=0.01, help="DSM min sigma in nm.")
+    parser.add_argument("--dsm-sigma-max", type=float, default=1.0, help="DSM max sigma in nm.")
+    parser.add_argument("--dsm-n-levels", type=int, default=6, help="DSM log-spaced noise levels.")
+    parser.add_argument("--dsm-temperature", type=float, default=300.0, help="kT used for DSM target scaling (K).")
 
     args = parser.parse_args()
+    if args.gpus != "cpu":
+        assert torch.cuda.is_available(), (
+            "CUDA is not available, please run on a machine with CUDA or use --gpus cpu"
+        )
 
     directory_path = args.input
     assert os.path.isdir(directory_path), f"Input directory does not exist: {directory_path}"
