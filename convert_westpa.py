@@ -111,7 +111,11 @@ def _load_segment(task: tuple):
     (idx, coords_A, forces, n_frames, cell_lengths, cell_angles)."""
     seq_idx, iter_num, walker_idx, weight, dcd_path, npz_path = task
     seg_traj = md.load(dcd_path, top=_GLOBAL_TOPOLOGY)
-    coords_full = seg_traj.xyz.astype(np.float32)                 # nanometers (mdtraj convention)
+    # FullDCDReporter passes nm values to mdtraj.formats.DCDTrajectoryFile.write(),
+    # which expects Angstroms. Stored disk values are therefore 10x too small when
+    # read back as Angstroms and then divided by 10 by mdtraj.load to give nm.
+    # Multiply by 10 to recover real nm positions.
+    coords_full = (seg_traj.xyz * 10.0).astype(np.float32)
     seg_data = np.load(npz_path)
     forces_full = seg_data["forces"].astype(np.float32)
     if forces_full.shape[0] != coords_full.shape[0]:
