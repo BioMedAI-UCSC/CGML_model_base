@@ -840,7 +840,7 @@ class Preprocessor:
         np.save(f"{output_path}/raw/forces.npy", forces)
         np.save(f"{output_path}/raw/coordinates.npy", trajectory.xyz)
         box_path = f"{output_path}/raw/box.npy"
-        if self.box:
+        if self.box and trajectory.unitcell_vectors is not None:
             np.save(box_path, trajectory.unitcell_vectors)
         elif os.path.exists(box_path):
             os.unlink(box_path)
@@ -968,7 +968,9 @@ class Preprocessor:
         prior_energy_npz = f'{output_path}/raw/prior_energy.npy'
         box_npz = None
         if self.box:
-            box_npz = f"{output_path}/raw/box.npy"
+            candidate_box = f"{output_path}/raw/box.npy"
+            if os.path.exists(candidate_box):
+                box_npz = candidate_box
         forcefield = os.path.join(self.save_path, "priors.yaml")
         psf_file = f'{output_path}/processed/{pdbid}_processed.psf'
         prior_params = self.prior_builder.prior_params
