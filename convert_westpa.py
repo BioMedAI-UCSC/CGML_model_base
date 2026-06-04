@@ -117,6 +117,10 @@ def _load_segment(task: tuple):
     # Multiply by 10 to recover real nm positions.
     coords_full = (seg_traj.xyz * 10.0).astype(np.float32)
     seg_data = np.load(npz_path)
+    if "forces" not in seg_data.files:
+        # bstate / non-MD iterations skip the openmm propagation, so the npz only
+        # carries pcoord; nothing to learn from. Tell the driver to drop it.
+        return seq_idx, weight, 0, None, None, None, None
     forces_full = seg_data["forces"].astype(np.float32)
     if forces_full.shape[0] != coords_full.shape[0]:
         raise RuntimeError(
@@ -288,6 +292,11 @@ def main():
                     pending[seq_idx] = (weight, n_f, coords, forces, cell_l, cell_a)
                     while next_seq in pending:
                         weight, n_f, coords, forces, cell_l, cell_a = pending.pop(next_seq)
+                        if n_f == 0 or forces is None:
+                            # bstate-only segment (no MD propagation)
+                            next_seq += 1
+                            pbar.update(1)
+                            continue
                         times = np.arange(frame_offset, frame_offset + n_f, dtype=np.float32)
                         h5traj.write(
                             coordinates=coords, time=times,
