@@ -393,6 +393,21 @@ class Prior_CA_DNA(Prior_CA):
     def build_mapping(self, topology):
         return CGMapping(topology, CGMappingDef_CA_DNA())
 
+    def select_atoms(self, topology):
+        # Parent Prior_CA selects 'name CA and protein', which silently
+        # drops DNA P beads when this prior is used. Honor the joint
+        # protein + DNA mapping: any CA atom OR any P atom whose residue
+        # is registered as a DNA residue in CGMappingDef_CA_DNA.
+        map_def = CGMappingDef_CA_DNA()
+        dna_residues = {r for r in map_def.bead_embeddings if r not in ("ALA","ARG","ASN","ASP","CYS","GLU","GLN","GLY","HIS","ILE","LEU","LYS","MET","PHE","PRO","SER","THR","TRP","TYR","VAL")}
+        idx = []
+        for a in topology.atoms:
+            if a.name == "CA" and a.residue.is_protein:
+                idx.append(a.index)
+            elif a.name == "P" and a.residue.name in dna_residues:
+                idx.append(a.index)
+        return np.array(idx, dtype=int)
+
     def map_embeddings(self, selected_atoms, topology):  # pyright: ignore[reportIncompatibleMethodOverride]
         # Use the CGMappingDef's embedding table so DNA residues get distinct ids.
         map_def = CGMappingDef_CA_DNA()
@@ -422,6 +437,21 @@ class Prior_CA_DNA_RNA(Prior_CA_DNA):
 
     def build_mapping(self, topology):
         return CGMapping(topology, CGMappingDef_CA_DNA_RNA())
+
+    def select_atoms(self, topology):
+        # Like Prior_CA_DNA.select_atoms but also keeps RNA P beads.
+        # CGMappingDef_CA_DNA_RNA registers DA/DC/DG/DT for DNA and the
+        # single-letter A/C/G/U entries for RNA (AMBER OL3 convention).
+        protein_set = {"ALA","ARG","ASN","ASP","CYS","GLU","GLN","GLY","HIS","ILE","LEU","LYS","MET","PHE","PRO","SER","THR","TRP","TYR","VAL"}
+        map_def = CGMappingDef_CA_DNA_RNA()
+        nucleic_residues = {r for r in map_def.bead_embeddings if r not in protein_set}
+        idx = []
+        for a in topology.atoms:
+            if a.name == "CA" and a.residue.is_protein:
+                idx.append(a.index)
+            elif a.name == "P" and a.residue.name in nucleic_residues:
+                idx.append(a.index)
+        return np.array(idx, dtype=int)
 
     def map_embeddings(self, selected_atoms, topology):  # pyright: ignore[reportIncompatibleMethodOverride]
         map_def = CGMappingDef_CA_DNA_RNA()
